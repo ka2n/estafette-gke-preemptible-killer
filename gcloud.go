@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/compute/v1"
@@ -18,6 +19,7 @@ type GCloud struct {
 
 type GCloudClient interface {
 	DeleteNode(string) error
+	GetCreationTime(string) (time.Time, error)
 }
 
 // NewGCloudClient return a GCloud client
@@ -49,5 +51,15 @@ func NewGCloudClient(projectId string, zone string) (gcloud GCloudClient, err er
 // DeleteNode delete a GCloud instance from a given node name
 func (g *GCloud) DeleteNode(name string) (err error) {
 	_, err = g.Service.Instances.Delete(g.ProjectID, g.Zone, name).Context(context.Background()).Do()
+	return
+}
+
+func (g *GCloud) GetCreationTime(name string) (t time.Time, err error) {
+	resp, err := g.Service.Instances.Get(g.ProjectID, g.Zone, name).Context(context.Background()).Do()
+	if err != nil {
+		return t, err
+	}
+
+	t, err = time.Parse(time.RFC3339, resp.CreationTimestamp)
 	return
 }

@@ -12,21 +12,23 @@ import (
 	"time"
 
 	"github.com/alecthomas/kingpin"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-
 	apiv1 "github.com/ericchiang/k8s/api/v1"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 // annotationGKEPreemptibleKillerState is the key of the annotation to use to store the expiry datetime
 const annotationGKEPreemptibleKillerState string = "estafette.io/gke-preemptible-killer-state"
+const annotationGKEPreemptibleKillerStateInstanceID string = "estafette.io/gke-preemptible-killer-state-instance_id"
+const annotationGKEInstanceID string = "container.googleapis.com/instance_id"
 
 // GKEPreemptibleKillerState represents the state of gke-preemptible-killer
 type GKEPreemptibleKillerState struct {
-	ExpiryDatetime string `json:"expiryDatetime"`
+	ExpiryDatetime    string `json:"expiryDatetime"`
+	LastInstanceID    string `json:"lastInstanceID"`
+	CurrentInstanceID string `json:"currentInstanceID"`
 }
 
 var (
@@ -182,12 +184,49 @@ func getCurrentNodeState(node *apiv1.Node) (state GKEPreemptibleKillerState) {
 	if !ok {
 		state.ExpiryDatetime = ""
 	}
+
+	state.LastInstanceID, ok = node.Metadata.Annotations[annotationGKEPreemptibleKillerStateInstanceID]
+	if !ok {
+		state.LastInstanceID = ""
+	}
+
+	state.CurrentInstanceID, ok = node.Metadata.Annotations[annotationGKEInstanceID]
+	if !ok {
+		state.CurrentInstanceID = ""
+	}
+
+	return
+}
+
+func setNodeInstanceID(k KubernetesClient, node *apiv1.Node, state GKEPreemptibleKillerState) (err error) {
+	log.Info().
+		Str("host", *node.Metadata.Name).
+		Msgf("instanceID annotation not found, adding %s to %s", annotationGKEPreemptibleKillerStateInstanceID, state.CurrentInstanceID)
+
+	err = k.SetNodeAnnotation(*node.Metadata.Name, annotationGKEPreemptibleKillerStateInstanceID, state.CurrentInstanceID)
+	if err != nil {
+		log.Warn().
+			Err(err).
+			Str("host", *node.Metadata.Name).
+			Msg("Error updating node metadata")
+	}
 	return
 }
 
 // getDesiredNodeState define the state of the node, update node annotations if not present
-func getDesiredNodeState(k KubernetesClient, node *apiv1.Node) (state GKEPreemptibleKillerState, err error) {
-	t := time.Unix(*node.Metadata.CreationTimestamp.Seconds, 0)
+func getDesiredNodeState(k KubernetesClient, g GCloudClient, node *apiv1.Node, in GKEPreemptibleKillerState) (state GKEPreemptibleKillerState, err error) {
+	state = in
+
+	var t time.Time
+	t, err = g.GetCreationTime(*node.Metadata.Name)
+	if err != nil {
+		log.Warn().
+			Err(err).
+			Str("host", *node.Metadata.Name).
+			Msg("Error getting instance metadata, continuing with node CreationTimestamp value instead")
+		t = time.Unix(*node.Metadata.CreationTimestamp.Seconds, 0)
+	}
+
 	drainTimeoutTime := time.Duration(*drainTimeout) * time.Second
 	// 43200 = 12h * 60m * 60s
 	randomTimeBetween0to12 := time.Duration(randomEstafette.Intn((43200)-*drainTimeout)) * time.Second
@@ -223,9 +262,35 @@ func processNode(k KubernetesClient, node *apiv1.Node) (err error) {
 	// get current node state
 	state := getCurrentNodeState(node)
 
+	var projectID string
+	var zone string
+	projectID, zone, err = k.GetProjectIdAndZoneFromNode(*node.Metadata.Name)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("host", *node.Metadata.Name).
+			Msg("Error getting project id and zone from node")
+		return
+	}
+
+	var gcloud GCloudClient
+	gcloud, err = NewGCloudClient(projectID, zone)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("host", *node.Metadata.Name).
+			Msg("Error creating GCloud client")
+		return
+	}
+
+	// set node state if instanceID is changed
+	nodeRecreated := state.CurrentInstanceID != "" && state.LastInstanceID != "" && state.CurrentInstanceID != state.LastInstanceID
+
 	// set node state if doesn't already have annotations
-	if state.ExpiryDatetime == "" {
-		state, _ = getDesiredNodeState(k, node)
+	if state.ExpiryDatetime == "" || nodeRecreated {
+		state, _ = getDesiredNodeState(k, gcloud, node, state)
 	}
 
 	// compute time difference
@@ -255,29 +320,6 @@ func processNode(k KubernetesClient, node *apiv1.Node) (err error) {
 				Err(err).
 				Str("host", *node.Metadata.Name).
 				Msg("Error setting node to unschedulable state")
-			return
-		}
-
-		var projectId string
-		var zone string
-		projectId, zone, err = k.GetProjectIdAndZoneFromNode(*node.Metadata.Name)
-
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("host", *node.Metadata.Name).
-				Msg("Error getting project id and zone from node")
-			return
-		}
-
-		var gcloud GCloudClient
-		gcloud, err = NewGCloudClient(projectId, zone)
-
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("host", *node.Metadata.Name).
-				Msg("Error creating GCloud client")
 			return
 		}
 
@@ -321,6 +363,24 @@ func processNode(k KubernetesClient, node *apiv1.Node) (err error) {
 			Msg("Node deleted")
 
 		return
+	} else if nodeRecreated {
+		log.Info().
+			Str("host", *node.Metadata.Name).
+			Msgf("Node recreate detected, set schedulable...")
+
+		// Set node schedulable
+		err = k.SetUnschedulableState(*node.Metadata.Name, false)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("host", *node.Metadata.Name).
+				Msg("Error setting node to unschedulable state")
+			return
+		}
+	}
+
+	if state.CurrentInstanceID != state.LastInstanceID {
+		_ = setNodeInstanceID(k, node, state)
 	}
 
 	nodeTotals.With(prometheus.Labels{"status": "skipped"}).Inc()

@@ -5,11 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
-
 	"github.com/ericchiang/k8s"
 	apiv1 "github.com/ericchiang/k8s/api/v1"
 	metav1 "github.com/ericchiang/k8s/apis/meta/v1"
+	"github.com/rs/zerolog"
 )
 
 type FakeKubernetes struct {
@@ -44,6 +43,22 @@ func (k *FakeKubernetes) SetUnschedulableState(name string, unschedulable bool) 
 
 func (k *FakeKubernetes) GetPreemptibleNodes() (*apiv1.NodeList, error) {
 	return &apiv1.NodeList{}, nil
+}
+
+type FakeGCloud struct {
+	creationTime time.Time
+}
+
+func FakeNewGCloudClient(t time.Time) GCloudClient {
+	return &FakeGCloud{t}
+}
+
+func (g *FakeGCloud) DeleteNode(name string) error {
+	return nil
+}
+
+func (g *FakeGCloud) GetCreationTime(name string) (time.Time, error) {
+	return g.creationTime, nil
 }
 
 func TestGetCurrentNodeState(t *testing.T) {
@@ -81,8 +96,9 @@ func TestGetDesiredNodeState(t *testing.T) {
 	}
 
 	client := FakeNewKubernetesClient()
+	gcloud := FakeNewGCloudClient(creationTimestamp)
 
-	state, _ := getDesiredNodeState(client, node)
+	state, _ := getDesiredNodeState(client, gcloud, node, GKEPreemptibleKillerState{})
 	stateTS, _ := time.Parse(time.RFC3339, state.ExpiryDatetime)
 
 	if !creationTimestamp12HoursLater.Before(stateTS) && !creationTimestamp24HoursLater.After(stateTS) {
@@ -90,7 +106,7 @@ func TestGetDesiredNodeState(t *testing.T) {
 	}
 
 	randomEstafette = rand.New(rand.NewSource(0))
-	stateWithPreseed, _ := getDesiredNodeState(client, node)
+	stateWithPreseed, _ := getDesiredNodeState(client, gcloud, node, GKEPreemptibleKillerState{})
 	if stateWithPreseed.ExpiryDatetime != "2017-11-12T11:27:54Z" {
 		t.Errorf("Expect expiry date time to be 2017-11-12T11:27:54Z, instead got %s", stateWithPreseed.ExpiryDatetime)
 	}
